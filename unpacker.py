@@ -74,6 +74,27 @@ class ImageUnpacker:
 
         return False
 
+    def _read_manifest_layer_order(self, outer_tar: tarfile.TarFile) -> Optional[List[str]]:
+        try:
+            manifest_member = outer_tar.getmember("manifest.json")
+        except KeyError:
+            return None
+
+        f = outer_tar.extractfile(manifest_member)
+        if f is None:
+            return None
+
+        try:
+            manifest_data = json.loads(f.read().decode("utf-8"))
+        except (json.JSONDecodeError, Exception):
+            return None
+
+        if isinstance(manifest_data, list) and len(manifest_data) > 0:
+            layers = manifest_data[0].get("Layers", [])
+            if layers:
+                return layers
+        return None
+
     def _scan_local_tar(self, tar_path: str) -> ScanResult:
         with tarfile.open(tar_path, "r") as tar:
             if self._is_docker_save_format(tar):
@@ -110,36 +131,56 @@ class ImageUnpacker:
             return self._extract_packages_from_image_tar(tar)
 
     def _extract_packages_from_image_tar(self, outer_tar: tarfile.TarFile) -> ScanResult:
-        layer_tars = []
-        for member in outer_tar.getmembers():
-            if member.isfile() and member.name.endswith("/layer.tar"):
-                layer_tars.append(member.name)
+        manifest_order = self._read_manifest_layer_order(outer_tar)
+
+        if manifest_order:
+            print(f"Using manifest layer order ({len(manifest_order)} layers)")
+            layer_tars = manifest_order
+        else:
+            print("Warning: manifest.json missing or invalid, using tar file order")
+            layer_tars = []
+            for member in outer_tar.getmembers():
+                if member.isfile() and member.name.endswith("/layer.tar"):
+                    layer_tars.append(member.name)
 
         print(f"Found {len(layer_tars)} layers to scan")
 
-        merged_os_packages: Dict[str, Dict[str, Package]] = {}
-        merged_os_dbs: Dict[str, bool] = {}
+        last_dpkg_content: Optional[str] = None
+        last_rpm_content: Optional[bytes] = None
+        last_rpm_path: Optional[str] = None
+        last_apk_content: Optional[str] = None
+        last_os_db_sources: Dict[str, str] = {}
+
         all_lang_packages: List[Package] = []
         seen_lang_files: Set[str] = set()
 
         for layer_idx, layer_tar_name in enumerate(layer_tars):
-            layer_file = outer_tar.extractfile(layer_tar_name)
+            try:
+                layer_member = outer_tar.getmember(layer_tar_name)
+            except KeyError:
+                print(f"  Layer {layer_idx}: {layer_tar_name} not found in tar, skipping")
+                continue
+
+            layer_file = outer_tar.extractfile(layer_member)
             if layer_file is None:
                 continue
 
             with tarfile.open(fileobj=layer_file, mode="r") as layer_tar:
-                os_packages, db_types = self._scan_layer_for_os_packages(
-                    layer_tar, layer_idx
-                )
-                for pkg in os_packages:
-                    key = f"{pkg.source}:{pkg.name}"
-                    if key in merged_os_packages:
-                        old_pkg = merged_os_packages[key]
-                        if old_pkg.version != pkg.version:
-                            print(f"  Layer {layer_idx}: {pkg.name} upgraded {old_pkg.version} -> {pkg.version}")
-                    merged_os_packages[key] = pkg
-                    for db_type in db_types:
-                        merged_os_dbs[db_type] = True
+                dpkg_status_content = self._extract_os_db_content(layer_tar, "dpkg", layer_idx)
+                if dpkg_status_content is not None:
+                    last_dpkg_content = dpkg_status_content
+                    last_os_db_sources["dpkg"] = f"Layer {layer_idx}"
+
+                rpm_content_tuple = self._extract_os_db_content(layer_tar, "rpm", layer_idx)
+                if rpm_content_tuple is not None:
+                    last_rpm_content, rpm_path = rpm_content_tuple
+                    last_rpm_path = rpm_path
+                    last_os_db_sources["rpm"] = f"Layer {layer_idx} ({rpm_path})"
+
+                apk_content = self._extract_os_db_content(layer_tar, "apk", layer_idx)
+                if apk_content is not None:
+                    last_apk_content = apk_content
+                    last_os_db_sources["apk"] = f"Layer {layer_idx}"
 
                 lang_packages, new_files = self._scan_layer_for_language_deps(
                     layer_tar, seen_lang_files
@@ -147,11 +188,27 @@ class ImageUnpacker:
                 all_lang_packages.extend(lang_packages)
                 seen_lang_files.update(new_files)
 
-        final_os_packages = list(merged_os_packages.values())
+        final_os_packages: List[Package] = []
 
-        for db_type in merged_os_dbs:
-            count = sum(1 for p in final_os_packages if p.source == "os")
-            print(f"  Merged {db_type} packages: {count} (after layer deduplication)")
+        if last_dpkg_content is not None:
+            dpkg_packages = self._parse_dpkg_status(last_dpkg_content)
+            print(f"  Final dpkg packages: {len(dpkg_packages)} (from {last_os_db_sources.get('dpkg', 'unknown')})")
+            final_os_packages.extend(dpkg_packages)
+
+        if last_rpm_content is not None:
+            rpm_packages = self._parse_rpm_packages(
+                last_rpm_content, last_rpm_path or "unknown", last_rpm_path or "var/lib/rpm/Packages"
+            )
+            print(f"  Final rpm packages: {len(rpm_packages)} (from {last_os_db_sources.get('rpm', 'unknown')})")
+            final_os_packages.extend(rpm_packages)
+
+        if last_apk_content is not None:
+            apk_packages = self._parse_apk_installed(last_apk_content)
+            print(f"  Final apk packages: {len(apk_packages)} (from {last_os_db_sources.get('apk', 'unknown')})")
+            final_os_packages.extend(apk_packages)
+
+        for db_type, source_info in last_os_db_sources.items():
+            print(f"  {db_type} database source: {source_info}")
 
         all_packages = final_os_packages + all_lang_packages
 
@@ -161,49 +218,136 @@ class ImageUnpacker:
 
         return ScanResult(packages=all_packages, warnings=self.warnings)
 
+    def _extract_os_db_content(
+        self, tar: tarfile.TarFile, db_type: str, layer_idx: int
+    ) -> Optional:
+        db_paths = PACKAGE_DB_PATHS.get(db_type, [])
+        if isinstance(db_paths, str):
+            db_paths = [db_paths]
+
+        if db_type == "rpm":
+            return self._extract_rpm_content_multi_path(tar, db_paths, layer_idx)
+
+        for db_path in db_paths:
+            member = self._find_member_in_tar(tar, db_path)
+            if member and member.isfile():
+                f = tar.extractfile(member)
+                if f:
+                    content_bytes = f.read()
+                    content = content_bytes.decode("utf-8", errors="ignore")
+                    if content.strip():
+                        print(f"  Layer {layer_idx}: Found {db_type} database ({db_path})")
+                        return content
+        return None
+
+    def _extract_rpm_content_multi_path(
+        self, tar: tarfile.TarFile, db_paths: List[str], layer_idx: int
+    ) -> Optional[Tuple[bytes, str]]:
+        rpm_warnings_for_layer = []
+
+        for db_path in db_paths:
+            member = self._find_member_in_tar(tar, db_path)
+            if not (member and member.isfile()):
+                continue
+
+            f = tar.extractfile(member)
+            if f is None:
+                continue
+
+            content_bytes = f.read()
+            if not content_bytes:
+                continue
+
+            packages = self._parse_rpm_packages_fast(content_bytes, db_path)
+            if packages:
+                print(f"  Layer {layer_idx}: Found {len(packages)} rpm packages ({db_path})")
+                return (content_bytes, db_path)
+            else:
+                if content_bytes[:16] == b"SQLite format 3\x00":
+                    rpm_warnings_for_layer.append(
+                        f"RPM SQLite at {db_path} (empty or unparseable)"
+                    )
+                elif len(content_bytes) >= 4 and content_bytes[:4] == b"\x00\x06\x15\x61":
+                    rpm_warnings_for_layer.append(
+                        f"RPM BDB at {db_path} (no rpm libs available)"
+                    )
+                elif len(content_bytes) >= 8 and content_bytes[:8] == b"RPM\x00NDBC":
+                    rpm_warnings_for_layer.append(
+                        f"RPM NDB at {db_path} (no rpm libs available)"
+                    )
+                else:
+                    rpm_warnings_for_layer.append(
+                        f"RPM database at {db_path} unrecognized format, "
+                        f"magic={content_bytes[:8].hex() if len(content_bytes) >= 8 else 'N/A'}"
+                    )
+
+        if rpm_warnings_for_layer:
+            self.warnings.extend(rpm_warnings_for_layer)
+
+        return None
+
+    def _parse_rpm_packages_fast(self, content_bytes: bytes, db_path: str) -> List[Package]:
+        packages: List[Package] = []
+
+        try:
+            import rpm
+            ts = rpm.TransactionSet()
+            hdr = ts.hdrFromFdno(io.BytesIO(content_bytes))
+            name = hdr[rpm.RPMTAG_NAME].decode() if hdr[rpm.RPMTAG_NAME] else ""
+            version = hdr[rpm.RPMTAG_VERSION].decode() if hdr[rpm.RPMTAG_VERSION] else ""
+            release = hdr[rpm.RPMTAG_RELEASE].decode() if hdr[rpm.RPMTAG_RELEASE] else ""
+            if name:
+                full_version = f"{version}-{release}" if release else version
+                packages.append(Package(name=name, version=full_version, source="os"))
+                return packages
+        except Exception:
+            pass
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["rpm", "-qp", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\n", "-"],
+                input=content_bytes,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = line.strip().split("\t")
+                    if len(parts) == 2 and parts[0]:
+                        packages.append(Package(name=parts[0], version=parts[1], source="os"))
+                if packages:
+                    return packages
+        except Exception:
+            pass
+
+        if content_bytes[:16] == b"SQLite format 3\x00":
+            sqlite_packages = self._parse_rpm_sqlite(content_bytes)
+            if sqlite_packages:
+                return sqlite_packages
+
+        return packages
+
     def _extract_packages_from_filesystem_tar(self, tar: tarfile.TarFile) -> List[Package]:
-        os_packages, _ = self._scan_layer_for_os_packages(tar, 0)
+        os_packages = []
+
+        dpkg_content = self._extract_os_db_content(tar, "dpkg", 0)
+        if dpkg_content:
+            os_packages.extend(self._parse_dpkg_status(dpkg_content))
+
+        rpm_tuple = self._extract_rpm_content_multi_path(
+            tar, PACKAGE_DB_PATHS.get("rpm", []), 0
+        )
+        if rpm_tuple is not None:
+            rpm_bytes, rpm_path = rpm_tuple
+            os_packages.extend(self._parse_rpm_packages(rpm_bytes, rpm_path, rpm_path))
+
+        apk_content = self._extract_os_db_content(tar, "apk", 0)
+        if apk_content:
+            os_packages.extend(self._parse_apk_installed(apk_content))
+
         lang_packages, _ = self._scan_layer_for_language_deps(tar, set())
         return os_packages + lang_packages
-
-    def _scan_layer_for_os_packages(
-        self, tar: tarfile.TarFile, layer_idx: int
-    ) -> Tuple[List[Package], Set[str]]:
-        packages: List[Package] = []
-        found_db_types: Set[str] = set()
-
-        for db_type, db_paths in PACKAGE_DB_PATHS.items():
-            if isinstance(db_paths, str):
-                db_paths = [db_paths]
-
-            for db_path in db_paths:
-                member = self._find_member_in_tar(tar, db_path)
-
-                if member and member.isfile():
-                    f = tar.extractfile(member)
-                    if f:
-                        content_bytes = f.read()
-                        content = content_bytes.decode("utf-8", errors="ignore")
-                        parsed_packages = []
-
-                        if db_type == "dpkg":
-                            parsed_packages = self._parse_dpkg_status(content)
-                        elif db_type == "rpm":
-                            parsed_packages = self._parse_rpm_packages(
-                                content_bytes, member.name, db_path
-                            )
-                        elif db_type == "apk":
-                            parsed_packages = self._parse_apk_installed(content)
-
-                        if parsed_packages:
-                            print(f"  Layer {layer_idx}: Found {len(parsed_packages)} {db_type} packages ({db_path})")
-                            packages.extend(parsed_packages)
-                            found_db_types.add(db_type)
-                            break
-
-                    break
-
-        return packages, found_db_types
 
     def _scan_layer_for_language_deps(
         self, tar: tarfile.TarFile, seen_files: Set[str]
@@ -283,9 +427,7 @@ class ImageUnpacker:
             if line.startswith("Package:"):
                 if current_package and "Package" in current_package:
                     status = current_package.get("Status", "")
-                    if "deinstall" in status:
-                        pass
-                    else:
+                    if status == "install ok installed":
                         packages.append(
                             Package(
                                 name=current_package["Package"],
@@ -304,7 +446,7 @@ class ImageUnpacker:
 
         if current_package and "Package" in current_package:
             status = current_package.get("Status", "")
-            if "deinstall" not in status:
+            if status == "install ok installed":
                 packages.append(
                     Package(
                         name=current_package["Package"],
@@ -350,13 +492,16 @@ class ImageUnpacker:
                 if packages:
                     return packages
             else:
-                self.warnings.append(f"rpm command failed: {result.stderr.strip()}")
+                err = result.stderr.strip()
+                if err:
+                    self.warnings.append(f"rpm command failed for {db_path}: {err}")
         except FileNotFoundError:
             self.warnings.append(
-                "'rpm' command not found. Install rpm package manager to parse RPM databases."
+                f"'rpm' command not found. Install rpm package manager to parse RPM databases "
+                f"at {db_path}."
             )
         except Exception as e:
-            self.warnings.append(f"rpm command error: {e}")
+            self.warnings.append(f"rpm command error for {db_path}: {e}")
 
         if content_bytes[:16] == b"SQLite format 3\x00":
             packages = self._parse_rpm_sqlite(content_bytes)
@@ -525,9 +670,14 @@ class ImageUnpacker:
                     version = dep.find("version")
 
                 if artifactId is not None and artifactId.text:
-                    name = artifactId.text
+                    gid = groupId.text if groupId is not None and groupId.text else ""
+                    aid = artifactId.text
                     ver = version.text if version is not None and version.text else "unknown"
-                    packages.append(Package(name=name, version=ver, source="java"))
+                    if gid:
+                        full_name = f"{gid}:{aid}"
+                    else:
+                        full_name = aid
+                    packages.append(Package(name=full_name, version=ver, source="java"))
         except Exception as e:
             self.warnings.append(f"pom.xml parse error: {e}")
         return packages
