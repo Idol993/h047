@@ -40,10 +40,12 @@ class Reporter:
         output_file: str = None,
         output_format: str = "table",
         fail_threshold: int = 5,
+        ignore_policy=None,
     ):
         self.output_file = output_file
         self.output_format = output_format
         self.fail_threshold = fail_threshold
+        self.ignore_policy = ignore_policy
         self.console = Console()
 
     def generate(
@@ -53,19 +55,45 @@ class Reporter:
         packages_count: int,
         packages_summary: Dict[str, int] = None,
         scan_warnings: List[str] = None,
+        packages_list: List = None,
     ):
+        self.active_vulns, self.ignored_vulns = self._split_vulns_by_ignore(vulnerabilities)
+
         if self.output_format == "json":
             self._generate_json(
-                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+                self.active_vulns, self.ignored_vulns, image_source,
+                packages_count, packages_summary, scan_warnings
             )
         elif self.output_format == "markdown":
             self._generate_markdown(
-                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+                self.active_vulns, self.ignored_vulns, image_source,
+                packages_count, packages_summary, scan_warnings
+            )
+        elif self.output_format == "cyclonedx":
+            self._generate_cyclonedx(
+                self.active_vulns, image_source,
+                packages_count, packages_summary, scan_warnings, packages_list
             )
         else:
             self._generate_table(
-                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+                self.active_vulns, self.ignored_vulns, image_source,
+                packages_count, packages_summary, scan_warnings
             )
+
+    def _split_vulns_by_ignore(self, vulnerabilities: List) -> Tuple[List, List]:
+        if not self.ignore_policy or not self.ignore_policy.has_rules():
+            return vulnerabilities, []
+
+        active = []
+        ignored = []
+        for v in vulnerabilities:
+            if self.ignore_policy.is_ignored(
+                cve_id=v.cve_id, package_name=v.package_name, severity=v.severity
+            ):
+                ignored.append(v)
+            else:
+                active.append(v)
+        return active, ignored
 
     def _get_output(self):
         if self.output_file and self.output_file != "/dev/stdout":
@@ -76,7 +104,8 @@ class Reporter:
         return SOURCE_DISPLAY.get(source, source)
 
     def _build_summary(
-        self, vulnerabilities: List, packages_count: int, packages_summary: Dict[str, int] = None
+        self, vulnerabilities: List, packages_count: int, packages_summary: Dict[str, int] = None,
+        ignored_vulns: List = None,
     ) -> dict:
         by_package: Dict[str, Dict] = defaultdict(
             lambda: {"count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "cves": [], "source": "os"}
@@ -129,6 +158,19 @@ class Reporter:
             "exit_code": 1 if high_risk_count > self.fail_threshold else 0,
         }
 
+        ignored_summary = None
+        if ignored_vulns:
+            ignored_by_severity = {
+                "critical": sum(1 for v in ignored_vulns if v.severity == "critical"),
+                "high": sum(1 for v in ignored_vulns if v.severity == "high"),
+                "medium": sum(1 for v in ignored_vulns if v.severity == "medium"),
+                "low": sum(1 for v in ignored_vulns if v.severity == "low"),
+            }
+            ignored_summary = {
+                "total_ignored": len(ignored_vulns),
+                "by_severity": ignored_by_severity,
+            }
+
         return {
             "total_packages_scanned": packages_count,
             "packages_by_source": packages_summary or {},
@@ -142,28 +184,42 @@ class Reporter:
             "by_source": by_source_display,
             "by_package": packages_dict,
             "ci": ci_summary,
+            "ignored": ignored_summary,
         }
 
     def _generate_json(
         self,
         vulnerabilities: List,
+        ignored_vulns: List,
         image_source: str,
         packages_count: int,
         packages_summary: Dict[str, int] = None,
         scan_warnings: List[str] = None,
     ):
-        summary = self._build_summary(vulnerabilities, packages_count, packages_summary)
+        summary = self._build_summary(vulnerabilities, packages_count, packages_summary, ignored_vulns)
 
         report = {
             "scan_metadata": {
                 "image_source": image_source,
                 "scan_time": datetime.now().isoformat(),
                 "scan_tool": "container-image-security-scanner",
-                "version": "3.0",
+                "version": "4.0",
             },
             "summary": summary,
             "vulnerabilities": [v.to_dict() for v in vulnerabilities],
         }
+
+        if ignored_vulns:
+            report["ignored_vulnerabilities"] = [v.to_dict() for v in ignored_vulns]
+
+        if self.ignore_policy and self.ignore_policy.has_rules():
+            report["ignore_policy"] = {
+                "rule_count": self.ignore_policy.rule_count(),
+                "rules": [
+                    {"type": r[0], "value": r[1]}
+                    for r in self.ignore_policy.rules
+                ],
+            }
 
         if scan_warnings:
             report["scan_warnings"] = scan_warnings
@@ -179,12 +235,13 @@ class Reporter:
     def _generate_markdown(
         self,
         vulnerabilities: List,
+        ignored_vulns: List,
         image_source: str,
         packages_count: int,
         packages_summary: Dict[str, int] = None,
         scan_warnings: List[str] = None,
     ):
-        summary = self._build_summary(vulnerabilities, packages_count, packages_summary)
+        summary = self._build_summary(vulnerabilities, packages_count, packages_summary, ignored_vulns)
         ci = summary["ci"]
         by_severity = summary["by_severity"]
 
@@ -213,6 +270,19 @@ class Reporter:
             lines.append(f"| {emoji} {sev.capitalize()} | **{by_severity[sev]}** |")
         lines.append(f"| **Total** | **{len(vulnerabilities)}** |")
         lines.append("")
+
+        if ignored_vulns:
+            lines.append("### 🙈 Ignored Vulnerabilities")
+            lines.append("")
+            ignored_stats = summary.get("ignored", {})
+            ignored_by_sev = ignored_stats.get("by_severity", {}) if ignored_stats else {}
+            lines.append("| Severity | Ignored |")
+            lines.append("|----------|---------|")
+            for sev in ["critical", "high", "medium", "low"]:
+                count = ignored_by_sev.get(sev, 0)
+                lines.append(f"| {sev.capitalize()} | {count} |")
+            lines.append(f"| **Total Ignored** | **{len(ignored_vulns)}** |")
+            lines.append("")
 
         if summary.get("by_source"):
             lines.append("### By Source")
@@ -278,7 +348,7 @@ class Reporter:
             lines.append("")
 
         lines.append("---")
-        lines.append(f"_Generated by Container Image Security Scanner v3.0_")
+        lines.append(f"_Generated by Container Image Security Scanner v4.0_")
 
         output_content = "\n".join(lines) + "\n"
 
@@ -292,6 +362,7 @@ class Reporter:
     def _generate_table(
         self,
         vulnerabilities: List,
+        ignored_vulns: List,
         image_source: str,
         packages_count: int,
         packages_summary: Dict[str, int] = None,
@@ -315,7 +386,10 @@ class Reporter:
         exceeds = high_risk > self.fail_threshold
         status = "[bold red]FAILED[/bold red]" if exceeds else "[bold green]PASSED[/bold green]"
         console.print(f"CI Status: {status} (High+ risk: {high_risk}/{self.fail_threshold})")
-        console.print(f"Total Vulnerabilities: {len(vulnerabilities)}\n")
+        console.print(f"Active Vulnerabilities: {len(vulnerabilities)}")
+        if ignored_vulns:
+            console.print(f"Ignored Vulnerabilities: {len(ignored_vulns)} (not counted in CI status)")
+        console.print()
 
         if scan_warnings:
             console.print("[yellow]Scan Warnings:[/yellow]")
@@ -388,7 +462,9 @@ class Reporter:
         counter = Counter(v.severity for v in vulnerabilities)
         return dict(counter)
 
-    def get_high_risk_count(self, vulnerabilities: List) -> int:
+    def get_high_risk_count(self, vulnerabilities: List = None) -> int:
+        if vulnerabilities is None:
+            vulnerabilities = getattr(self, 'active_vulns', [])
         count = 0
         high_rank = SEVERITY_RANK.get("high", 3)
         for v in vulnerabilities:
@@ -396,6 +472,116 @@ class Reporter:
                 count += 1
         return count
 
-    def should_fail(self, vulnerabilities: List, threshold: int = None) -> bool:
+    def should_fail(self, vulnerabilities: List = None, threshold: int = None) -> bool:
+        if vulnerabilities is None:
+            vulnerabilities = getattr(self, 'active_vulns', [])
         threshold = threshold if threshold is not None else self.fail_threshold
         return self.get_high_risk_count(vulnerabilities) > threshold
+
+    def _generate_cyclonedx(
+        self,
+        vulnerabilities: List,
+        image_source: str,
+        packages_count: int,
+        packages_summary: Dict[str, int] = None,
+        scan_warnings: List[str] = None,
+        packages_list: List = None,
+    ):
+        from datetime import datetime
+
+        components = []
+        bom_refs = {}
+
+        all_packages = packages_list or []
+
+        for pkg in all_packages:
+            purl = self._make_purl(pkg.name, pkg.version, pkg.source)
+            bom_ref = purl
+            component = {
+                "type": "library",
+                "name": pkg.name,
+                "version": pkg.version,
+                "purl": purl,
+                "bom-ref": bom_ref,
+            }
+            if pkg.source:
+                component["properties"] = [
+                    {"name": "source", "value": self._source_label(pkg.source)}
+                ]
+            components.append(component)
+            bom_refs[f"{pkg.name}@{pkg.version}"] = bom_ref
+
+        vulns_cyclone = []
+        for v in vulnerabilities:
+            pkg_key = f"{v.package_name}@{v.package_version}"
+            bom_ref = bom_refs.get(pkg_key, v.package_name)
+
+            vuln_entry = {
+                "id": v.cve_id,
+                "source": {"name": self._source_label(v.source).upper()},
+                "ratings": [
+                    {
+                        "severity": v.severity,
+                        "score": v.cvss_score,
+                        "method": "CVSSv31",
+                    }
+                ],
+                "description": v.description,
+                "affects": [{"ref": bom_ref}],
+            }
+            if v.fix_version:
+                vuln_entry["fixes"] = [{"version": v.fix_version}]
+            vulns_cyclone.append(vuln_entry)
+
+        bom = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "tools": [
+                    {
+                        "vendor": "container-image-security-scanner",
+                        "name": "scanner",
+                        "version": "4.0",
+                    }
+                ],
+                "component": {
+                    "type": "container",
+                    "name": image_source,
+                },
+            },
+            "components": components,
+            "vulnerabilities": vulns_cyclone,
+        }
+
+        if scan_warnings:
+            bom["metadata"]["properties"] = [
+                {"name": f"warning_{i}", "value": w}
+                for i, w in enumerate(scan_warnings)
+            ]
+
+        f = self._get_output()
+        try:
+            json.dump(bom, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        finally:
+            if f is not sys.stdout:
+                f.close()
+
+    def _make_purl(self, name: str, version: str, source: str) -> str:
+        from urllib.parse import quote
+
+        if source == "python":
+            return f"pkg:pypi/{quote(name)}@{version}"
+        elif source == "nodejs":
+            return f"pkg:npm/{quote(name)}@{version}"
+        elif source == "java":
+            if ":" in name:
+                gid, aid = name.split(":", 1)
+                return f"pkg:maven/{quote(gid)}/{quote(aid)}@{version}"
+            return f"pkg:maven/{quote(name)}@{version}"
+        elif source == "os":
+            return f"pkg:generic/{quote(name)}@{version}"
+        else:
+            return f"pkg:generic/{quote(name)}@{version}"

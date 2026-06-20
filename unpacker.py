@@ -74,6 +74,27 @@ class ImageUnpacker:
 
         return False
 
+    def _is_oci_format(self, tar: tarfile.TarFile) -> bool:
+        try:
+            oci_layout = tar.getmember("oci-layout")
+            if oci_layout is None:
+                return False
+        except KeyError:
+            return False
+
+        try:
+            index_json = tar.getmember("index.json")
+            if index_json is None:
+                return False
+        except KeyError:
+            return False
+
+        for member in tar.getmembers():
+            if member.name.startswith("blobs/sha256/") and member.isfile():
+                return True
+
+        return False
+
     def _read_manifest_layer_order(self, outer_tar: tarfile.TarFile) -> Optional[List[str]]:
         try:
             manifest_member = outer_tar.getmember("manifest.json")
@@ -97,7 +118,10 @@ class ImageUnpacker:
 
     def _scan_local_tar(self, tar_path: str) -> ScanResult:
         with tarfile.open(tar_path, "r") as tar:
-            if self._is_docker_save_format(tar):
+            if self._is_oci_format(tar):
+                print(f"Detected OCI archive format, extracting from blobs...")
+                return self._extract_packages_from_oci_tar(tar)
+            elif self._is_docker_save_format(tar):
                 print(f"Detected docker save format, extracting from layers...")
                 return self._extract_packages_from_image_tar(tar)
             else:
@@ -166,6 +190,125 @@ class ImageUnpacker:
                 continue
 
             with tarfile.open(fileobj=layer_file, mode="r") as layer_tar:
+                dpkg_status_content = self._extract_os_db_content(layer_tar, "dpkg", layer_idx)
+                if dpkg_status_content is not None:
+                    last_dpkg_content = dpkg_status_content
+                    last_os_db_sources["dpkg"] = f"Layer {layer_idx}"
+
+                rpm_content_tuple = self._extract_os_db_content(layer_tar, "rpm", layer_idx)
+                if rpm_content_tuple is not None:
+                    last_rpm_content, rpm_path = rpm_content_tuple
+                    last_rpm_path = rpm_path
+                    last_os_db_sources["rpm"] = f"Layer {layer_idx} ({rpm_path})"
+
+                apk_content = self._extract_os_db_content(layer_tar, "apk", layer_idx)
+                if apk_content is not None:
+                    last_apk_content = apk_content
+                    last_os_db_sources["apk"] = f"Layer {layer_idx}"
+
+                lang_packages, new_files = self._scan_layer_for_language_deps(
+                    layer_tar, seen_lang_files
+                )
+                all_lang_packages.extend(lang_packages)
+                seen_lang_files.update(new_files)
+
+        final_os_packages: List[Package] = []
+
+        if last_dpkg_content is not None:
+            dpkg_packages = self._parse_dpkg_status(last_dpkg_content)
+            print(f"  Final dpkg packages: {len(dpkg_packages)} (from {last_os_db_sources.get('dpkg', 'unknown')})")
+            final_os_packages.extend(dpkg_packages)
+
+        if last_rpm_content is not None:
+            rpm_packages = self._parse_rpm_packages(
+                last_rpm_content, last_rpm_path or "unknown", last_rpm_path or "var/lib/rpm/Packages"
+            )
+            print(f"  Final rpm packages: {len(rpm_packages)} (from {last_os_db_sources.get('rpm', 'unknown')})")
+            final_os_packages.extend(rpm_packages)
+
+        if last_apk_content is not None:
+            apk_packages = self._parse_apk_installed(last_apk_content)
+            print(f"  Final apk packages: {len(apk_packages)} (from {last_os_db_sources.get('apk', 'unknown')})")
+            final_os_packages.extend(apk_packages)
+
+        for db_type, source_info in last_os_db_sources.items():
+            print(f"  {db_type} database source: {source_info}")
+
+        all_packages = final_os_packages + all_lang_packages
+
+        if not all_packages:
+            for warning in self.warnings:
+                print(f"Warning: {warning}")
+
+        return ScanResult(packages=all_packages, warnings=self.warnings)
+
+    def _extract_packages_from_oci_tar(self, outer_tar: tarfile.TarFile) -> ScanResult:
+        try:
+            index_member = outer_tar.getmember("index.json")
+            index_f = outer_tar.extractfile(index_member)
+            if index_f is None:
+                self.warnings.append("OCI index.json not readable")
+                return ScanResult(packages=[], warnings=self.warnings)
+            index_data = json.loads(index_f.read().decode("utf-8"))
+        except (KeyError, json.JSONDecodeError, Exception) as e:
+            self.warnings.append(f"Failed to parse OCI index.json: {e}")
+            return ScanResult(packages=[], warnings=self.warnings)
+
+        manifests = index_data.get("manifests", [])
+        if not manifests:
+            self.warnings.append("OCI index.json has no manifests")
+            return ScanResult(packages=[], warnings=self.warnings)
+
+        first_manifest = manifests[0]
+        manifest_digest = first_manifest.get("digest", "")
+        if not manifest_digest:
+            self.warnings.append("OCI first manifest missing digest")
+            return ScanResult(packages=[], warnings=self.warnings)
+
+        manifest_blob_path = f"blobs/sha256/{manifest_digest.split(':')[-1]}"
+        try:
+            manifest_member = outer_tar.getmember(manifest_blob_path)
+            manifest_f = outer_tar.extractfile(manifest_member)
+            if manifest_f is None:
+                self.warnings.append(f"OCI manifest blob not readable: {manifest_blob_path}")
+                return ScanResult(packages=[], warnings=self.warnings)
+            manifest_data = json.loads(manifest_f.read().decode("utf-8"))
+        except (KeyError, json.JSONDecodeError, Exception) as e:
+            self.warnings.append(f"Failed to read OCI manifest blob: {e}")
+            return ScanResult(packages=[], warnings=self.warnings)
+
+        layers = manifest_data.get("layers", [])
+        layer_digests = [layer.get("digest", "") for layer in layers if layer.get("digest", "")]
+        print(f"Using OCI manifest layer order ({len(layer_digests)} layers)")
+        print(f"Found {len(layer_digests)} layers to scan")
+
+        last_dpkg_content: Optional[str] = None
+        last_rpm_content: Optional[bytes] = None
+        last_rpm_path: Optional[str] = None
+        last_apk_content: Optional[str] = None
+        last_os_db_sources: Dict[str, str] = {}
+
+        all_lang_packages: List[Package] = []
+        seen_lang_files: Set[str] = set()
+
+        for layer_idx, layer_digest in enumerate(layer_digests):
+            layer_blob_path = f"blobs/sha256/{layer_digest.split(':')[-1]}"
+            try:
+                layer_member = outer_tar.getmember(layer_blob_path)
+            except KeyError:
+                print(f"  Layer {layer_idx}: {layer_blob_path} not found, skipping")
+                continue
+
+            layer_file = outer_tar.extractfile(layer_member)
+            if layer_file is None:
+                continue
+
+            try:
+                layer_tar = tarfile.open(fileobj=layer_file, mode="r")
+            except Exception:
+                continue
+
+            with layer_tar:
                 dpkg_status_content = self._extract_os_db_content(layer_tar, "dpkg", layer_idx)
                 if dpkg_status_content is not None:
                     last_dpkg_content = dpkg_status_content
@@ -561,19 +704,36 @@ class ImageUnpacker:
                 conn = sqlite3.connect(temp_db_path)
                 cursor = conn.cursor()
                 try:
-                    cursor.execute(
-                        "SELECT Name, Version, Release FROM Packages"
-                    )
-                    rows = cursor.fetchall()
-                    for row in rows:
-                        name, version, release = row
-                        if name:
-                            full_version = f"{version}-{release}" if release else version
-                            packages.append(
-                                Package(name=name, version=full_version, source="os")
-                            )
+                    table_name, name_col, version_col, release_col = self._detect_rpm_sqlite_schema(cursor)
+
+                    if table_name and name_col:
+                        query = f'SELECT {name_col}, {version_col}, {release_col} FROM {table_name}'
+                        cursor.execute(query)
+                        rows = cursor.fetchall()
+                        for row in rows:
+                            name = row[0] if len(row) > 0 else ""
+                            version = row[1] if len(row) > 1 else ""
+                            release = row[2] if len(row) > 2 else ""
+                            if name:
+                                if isinstance(name, bytes):
+                                    name = name.decode("utf-8", errors="ignore")
+                                if isinstance(version, bytes):
+                                    version = version.decode("utf-8", errors="ignore")
+                                if isinstance(release, bytes):
+                                    release = release.decode("utf-8", errors="ignore")
+                                full_version = f"{version}-{release}" if release else version
+                                packages.append(
+                                    Package(name=name, version=full_version, source="os")
+                                )
                     if packages:
-                        print(f"  Successfully parsed {len(packages)} packages from RPM SQLite database")
+                        print(f"  Successfully parsed {len(packages)} packages from RPM SQLite database ({table_name})")
+                    else:
+                        tbl = table_name or "(unknown)"
+                        self.warnings.append(
+                            f"RPM SQLite database detected but no packages found in table '{tbl}'. "
+                            f"Schema may differ from expected. "
+                            f"Try: sqlite3 <image-extracted-path> '.tables' to inspect schema."
+                        )
                 except Exception as e:
                     self.warnings.append(f"RPM SQLite query failed: {e}")
                 finally:
@@ -587,6 +747,74 @@ class ImageUnpacker:
             self.warnings.append(f"RPM SQLite parse error: {e}")
 
         return packages
+
+    def _detect_rpm_sqlite_schema(self, cursor) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        table_candidates = ["Packages", "packages", "rpm_packages", "Packages_table"]
+        name_candidates = ["Name", "name", "pkgName", "pkg_name"]
+        version_candidates = ["Version", "version", "pkgVersion", "pkg_version"]
+        release_candidates = ["Release", "release", "pkgRelease", "pkg_release"]
+
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            all_tables = [row[0] for row in cursor.fetchall()]
+        except Exception:
+            return None, None, None, None
+
+        table_name = None
+        for cand in table_candidates:
+            if cand in all_tables:
+                table_name = cand
+                break
+
+        if not table_name:
+            for t in all_tables:
+                if "package" in t.lower():
+                    table_name = t
+                    break
+
+        if not table_name:
+            return None, None, None, None
+
+        try:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+        except Exception:
+            return None, None, None, None
+
+        name_col = None
+        for cand in name_candidates:
+            if cand in columns:
+                name_col = cand
+                break
+        if not name_col:
+            for col in columns:
+                if "name" in col.lower():
+                    name_col = col
+                    break
+
+        version_col = None
+        for cand in version_candidates:
+            if cand in columns:
+                version_col = cand
+                break
+        if not version_col:
+            for col in columns:
+                if "version" in col.lower():
+                    version_col = col
+                    break
+
+        release_col = None
+        for cand in release_candidates:
+            if cand in columns:
+                release_col = cand
+                break
+        if not release_col:
+            for col in columns:
+                if "release" in col.lower():
+                    release_col = col
+                    break
+
+        return table_name, name_col, version_col, release_col
 
     def _parse_apk_installed(self, content: str) -> List[Package]:
         packages = []

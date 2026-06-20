@@ -596,6 +596,323 @@ def test_source_label_mapping():
     print("  PASS")
 
 
+def test_rpm_sqlite_real_schema_lowercase():
+    print("TEST: RPM SQLite parses real-world lowercase schema (packages/name/version/release)...")
+    unpacker = ImageUnpacker()
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE packages (
+            name TEXT,
+            version TEXT,
+            release TEXT,
+            arch TEXT
+        )
+    """)
+    test_pkgs = [
+        ("bash", "5.2.15", "5.fc40", "x86_64"),
+        ("glibc", "2.39", "1.fc40", "x86_64"),
+        ("openssl-libs", "3.1.0", "2.fc40", "x86_64"),
+    ]
+    for pkg in test_pkgs:
+        cursor.execute("INSERT INTO packages VALUES (?, ?, ?, ?)", pkg)
+    conn.commit()
+    conn.close()
+
+    with open(db_path, "rb") as f:
+        sqlite_bytes = f.read()
+    os.unlink(db_path)
+
+    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as f:
+        tar_path = f.name
+
+    try:
+        with tarfile.open(tar_path, "w") as tar:
+            layer_bytes = io.BytesIO()
+            with tarfile.open(fileobj=layer_bytes, mode="w") as lt:
+                info = tarfile.TarInfo(name="usr/lib/sysimage/rpm/rpmdb.sqlite")
+                info.size = len(sqlite_bytes)
+                lt.addfile(info, io.BytesIO(sqlite_bytes))
+            layer_bytes.seek(0)
+
+            manifest = json.dumps([
+                {"Config": "config.json", "Layers": ["layer0/layer.tar"]}
+            ])
+            info = tarfile.TarInfo(name="manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest.encode()))
+
+            info = tarfile.TarInfo(name="layer0/layer.tar")
+            info.size = len(layer_bytes.getvalue())
+            tar.addfile(info, layer_bytes)
+
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+        try:
+            result = unpacker.scan(tar_path)
+        finally:
+            sys.stdout = old_stdout
+
+        os_pkgs = [p for p in result.packages if p.source == "os"]
+        pkg_dict = {p.name: p.version for p in os_pkgs}
+
+        assert len(os_pkgs) == 3, f"Expected 3 RPM packages, got {len(os_pkgs)}: {pkg_dict}"
+        assert "bash" in pkg_dict, f"bash not found in packages: {pkg_dict}"
+        assert pkg_dict["bash"] == "5.2.15-5.fc40", f"bash version wrong: {pkg_dict['bash']}"
+        assert "glibc" in pkg_dict, f"glibc not found in packages: {pkg_dict}"
+        assert "openssl-libs" in pkg_dict, f"openssl-libs not found: {pkg_dict}"
+
+        print(f"  PASS: lowercase schema parsed -> {len(os_pkgs)} packages (bash, glibc, openssl-libs)")
+    finally:
+        os.unlink(tar_path)
+
+
+def test_oci_archive_format():
+    print("TEST: OCI archive format detection and layer extraction...")
+    unpacker = ImageUnpacker()
+
+    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as f:
+        tar_path = f.name
+
+    try:
+        layer0_bytes = io.BytesIO()
+        with tarfile.open(fileobj=layer0_bytes, mode="w") as lt:
+            dpkg_1 = (
+                "Package: openssl\nVersion: 1.1.1\nStatus: install ok installed\n\n"
+                "Package: oldlib\nVersion: 1.0\nStatus: install ok installed\n"
+            )
+            info = tarfile.TarInfo(name="var/lib/dpkg/status")
+            info.size = len(dpkg_1)
+            lt.addfile(info, io.BytesIO(dpkg_1.encode()))
+        layer0_bytes.seek(0)
+        layer0_digest = "abc123layer0"
+
+        layer1_bytes = io.BytesIO()
+        with tarfile.open(fileobj=layer1_bytes, mode="w") as lt:
+            dpkg_2 = (
+                "Package: openssl\nVersion: 3.0.2\nStatus: install ok installed\n\n"
+                "Package: bash\nVersion: 5.2\nStatus: install ok installed\n"
+            )
+            info = tarfile.TarInfo(name="var/lib/dpkg/status")
+            info.size = len(dpkg_2)
+            lt.addfile(info, io.BytesIO(dpkg_2.encode()))
+        layer1_bytes.seek(0)
+        layer1_digest = "def456layer1"
+
+        manifest_data = json.dumps({
+            "schemaVersion": 2,
+            "config": {"digest": "sha256:config123", "size": 123},
+            "layers": [
+                {"digest": f"sha256:{layer0_digest}", "size": len(layer0_bytes.getvalue())},
+                {"digest": f"sha256:{layer1_digest}", "size": len(layer1_bytes.getvalue())},
+            ],
+        })
+        manifest_digest = "manifest789"
+
+        index_data = json.dumps({
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "digest": f"sha256:{manifest_digest}",
+                    "size": len(manifest_data),
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                }
+            ],
+        })
+
+        oci_layout = json.dumps({"imageLayoutVersion": "1.0.0"})
+
+        with tarfile.open(tar_path, "w") as tar:
+            info = tarfile.TarInfo(name="oci-layout")
+            info.size = len(oci_layout)
+            tar.addfile(info, io.BytesIO(oci_layout.encode()))
+
+            info = tarfile.TarInfo(name="index.json")
+            info.size = len(index_data)
+            tar.addfile(info, io.BytesIO(index_data.encode()))
+
+            info = tarfile.TarInfo(name=f"blobs/sha256/{manifest_digest}")
+            info.size = len(manifest_data)
+            tar.addfile(info, io.BytesIO(manifest_data.encode()))
+
+            info = tarfile.TarInfo(name=f"blobs/sha256/{layer0_digest}")
+            info.size = len(layer0_bytes.getvalue())
+            tar.addfile(info, layer0_bytes)
+
+            info = tarfile.TarInfo(name=f"blobs/sha256/{layer1_digest}")
+            info.size = len(layer1_bytes.getvalue())
+            tar.addfile(info, layer1_bytes)
+
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+        try:
+            result = unpacker.scan(tar_path)
+        finally:
+            sys.stdout = old_stdout
+
+        os_pkgs = [p for p in result.packages if p.source == "os"]
+        pkg_dict = {p.name: p.version for p in os_pkgs}
+
+        assert len(os_pkgs) == 2, f"Expected 2 OS packages, got {len(os_pkgs)}: {pkg_dict}"
+        assert pkg_dict["openssl"] == "3.0.2", f"openssl should be 3.0.2 (final layer), got {pkg_dict.get('openssl')}"
+        assert "oldlib" not in pkg_dict, f"oldlib should be removed in final layer, but still present: {pkg_dict}"
+        assert "bash" in pkg_dict, f"bash should be in final layer, but not found: {pkg_dict}"
+
+        print(f"  PASS: OCI format detected, final layer snapshot = {pkg_dict}")
+    finally:
+        os.unlink(tar_path)
+
+
+def test_cyclonedx_sbom_output():
+    print("TEST: CycloneDX SBOM output format contains components + vulnerabilities...")
+    from reporter import Reporter
+
+    packages_list = [
+        Package(name="openssl", version="3.0.2", source="os"),
+        Package(name="org.springframework:spring-core", version="5.3.20", source="java"),
+        Package(name="requests", version="2.31.0", source="python"),
+        Package(name="express", version="4.18.2", source="nodejs"),
+    ]
+
+    vulns = [
+        Vulnerability(
+            cve_id="CVE-2023-0001",
+            cvss_score=7.5,
+            severity="high",
+            description="Test vulnerability",
+            package_name="openssl",
+            package_version="3.0.2",
+            source="os",
+        ),
+        Vulnerability(
+            cve_id="CVE-2023-1234",
+            cvss_score=5.0,
+            severity="medium",
+            description="Spring test CVE",
+            package_name="org.springframework:spring-core",
+            package_version="5.3.20",
+            source="java",
+        ),
+    ]
+
+    output = io.StringIO()
+    reporter = Reporter(output_file=None, output_format="cyclonedx")
+    reporter.output_file = "/dev/stdout"
+
+    original_get_output = reporter._get_output
+
+    def mock_get_output():
+        return output
+
+    reporter._get_output = mock_get_output
+
+    original_close = output.close
+    output.close = lambda: None
+
+    try:
+        reporter.generate(vulns, "test-image:latest", 4, {"os": 1, "java": 1, "python": 1, "nodejs": 1}, [], packages_list=packages_list)
+    finally:
+        output.close = original_close
+
+    bom = json.loads(output.getvalue())
+
+    assert bom.get("bomFormat") == "CycloneDX", f"bomFormat wrong: {bom.get('bomFormat')}"
+    assert bom.get("specVersion") == "1.5", f"specVersion wrong: {bom.get('specVersion')}"
+    assert "components" in bom, "missing components"
+    assert "vulnerabilities" in bom, "missing vulnerabilities"
+    assert len(bom["components"]) == 4, f"Expected 4 components, got {len(bom['components'])}"
+
+    component_names = {c["name"] for c in bom["components"]}
+    assert "openssl" in component_names
+    assert "org.springframework:spring-core" in component_names
+
+    purls = {c["purl"] for c in bom["components"]}
+    maven_purls = [p for p in purls if p.startswith("pkg:maven/")]
+    assert len(maven_purls) == 1, f"Expected 1 maven purl, got {maven_purls}"
+    assert "spring-core" in maven_purls[0], f"Maven purl missing artifactId: {maven_purls[0]}"
+    assert "org.springframework" in maven_purls[0], f"Maven purl missing groupId: {maven_purls[0]}"
+
+    assert len(bom["vulnerabilities"]) == 2, f"Expected 2 vulns in SBOM, got {len(bom['vulnerabilities'])}"
+
+    print(f"  PASS: CycloneDX valid, 4 components, 2 vulns, Maven GAV in purl")
+
+
+def test_ignore_policy_file_rules():
+    print("TEST: Ignore policy filters by CVE, package, and severity...")
+    from config import IgnorePolicy
+
+    vulns = [
+        Vulnerability(cve_id="CVE-2023-1000", cvss_score=9.0, severity="critical",
+                      package_name="openssl", package_version="3.0.2", source="os"),
+        Vulnerability(cve_id="CVE-2023-2000", cvss_score=7.5, severity="high",
+                      package_name="openssl", package_version="3.0.2", source="os"),
+        Vulnerability(cve_id="CVE-2023-3000", cvss_score=5.0, severity="medium",
+                      package_name="bash", package_version="5.2", source="os"),
+        Vulnerability(cve_id="CVE-2023-4000", cvss_score=3.0, severity="low",
+                      package_name="curl", package_version="7.88.0", source="os"),
+        Vulnerability(cve_id="CVE-2023-5000", cvss_score=6.0, severity="medium",
+                      package_name="requests", package_version="2.31.0", source="python"),
+    ]
+
+    ignore_file_content = (
+        "# Ignore by CVE\n"
+        "CVE-2023-1000\n"
+        "# Ignore by package\n"
+        "package:bash\n"
+        "# Ignore by severity\n"
+        "severity:low\n"
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write(ignore_file_content)
+        ignore_path = f.name
+
+    try:
+        ignore_policy = IgnorePolicy()
+        loaded = ignore_policy.load_file(ignore_path)
+        assert loaded, "Failed to load ignore file"
+        assert ignore_policy.rule_count() == 3, f"Expected 3 rules, got {ignore_policy.rule_count()}"
+
+        from reporter import Reporter
+        reporter = Reporter(output_format="json", ignore_policy=ignore_policy)
+        reporter.output_file = "/dev/stdout"
+        output = io.StringIO()
+
+        original_close = output.close
+        output.close = lambda: None
+
+        reporter._get_output = lambda: output
+        reporter.generate(vulns, "test-image", 5, {"os": 4, "python": 1}, [])
+
+        output.close = original_close
+
+        active = reporter.active_vulns
+        ignored = reporter.ignored_vulns
+
+        assert len(active) == 2, f"Expected 2 active vulns, got {len(active)}: {[v.cve_id for v in active]}"
+        assert len(ignored) == 3, f"Expected 3 ignored vulns, got {len(ignored)}: {[v.cve_id for v in ignored]}"
+
+        active_cves = {v.cve_id for v in active}
+        ignored_cves = {v.cve_id for v in ignored}
+
+        assert "CVE-2023-1000" in ignored_cves, "CVE-2023-1000 should be ignored by CVE rule"
+        assert "CVE-2023-3000" in ignored_cves, "CVE-2023-3000 (bash) should be ignored by package rule"
+        assert "CVE-2023-4000" in ignored_cves, "CVE-2023-4000 (low) should be ignored by severity rule"
+
+        assert "CVE-2023-2000" in active_cves, "CVE-2023-2000 should be active"
+        assert "CVE-2023-5000" in active_cves, "CVE-2023-5000 (requests) should be active"
+
+        high_risk = reporter.get_high_risk_count()
+        assert high_risk == 1, f"Expected 1 high+ risk active vuln, got {high_risk}"
+
+        print(f"  PASS: 3 ignored, 2 active, high+ count = 1 (ignored CVE/pkg/severity all work)")
+    finally:
+        os.unlink(ignore_path)
+
+
 if __name__ == "__main__":
     import threading
 
@@ -615,6 +932,10 @@ if __name__ == "__main__":
         test_osv_java_query_uses_full_gav,
         test_dpkg_and_lang_parallel,
         test_source_label_mapping,
+        test_rpm_sqlite_real_schema_lowercase,
+        test_oci_archive_format,
+        test_cyclonedx_sbom_output,
+        test_ignore_policy_file_rules,
     ]
 
     failed = 0

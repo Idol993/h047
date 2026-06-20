@@ -1,9 +1,11 @@
 import sys
+import os
 import click
 
 from unpacker import ImageUnpacker
 from vulndb import VulnDB
 from reporter import Reporter
+from config import IgnorePolicy
 
 
 @click.group()
@@ -16,9 +18,9 @@ def cli():
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["table", "json", "markdown"]),
+    type=click.Choice(["table", "json", "markdown", "cyclonedx"]),
     default="table",
-    help="Output format (table, json, or markdown)",
+    help="Output format (table, json, markdown, or cyclonedx)",
     show_default=True,
 )
 @click.option(
@@ -54,6 +56,11 @@ def cli():
     help="Exit with code 1 if high+ vulnerabilities exceed this count",
     show_default=True,
 )
+@click.option(
+    "--ignore-file",
+    default=None,
+    help="Path to ignore rules file (default: .scannerignore if exists)",
+)
 def scan(
     image,
     output_format,
@@ -62,6 +69,7 @@ def scan(
     offline,
     cache_db,
     fail_threshold,
+    ignore_file,
 ):
     """Scan a container image for vulnerabilities.
 
@@ -69,6 +77,17 @@ def scan(
     """
     try:
         click.echo(f"Scanning image: {image}")
+
+        ignore_policy = IgnorePolicy()
+        if ignore_file:
+            if not ignore_policy.load_file(ignore_file):
+                click.echo(f"Warning: Ignore file not found: {ignore_file}")
+        else:
+            default_ignore = ".scannerignore"
+            if os.path.exists(default_ignore):
+                ignore_policy.load_file(default_ignore)
+                click.echo(f"Loaded ignore rules from {default_ignore} ({ignore_policy.rule_count()} rules)")
+
         unpacker = ImageUnpacker()
         scan_result = unpacker.scan(image)
         packages = scan_result.packages
@@ -94,6 +113,7 @@ def scan(
             output_file=output,
             output_format=output_format,
             fail_threshold=fail_threshold,
+            ignore_policy=ignore_policy,
         )
         reporter.generate(
             vulnerabilities,
@@ -101,10 +121,11 @@ def scan(
             len(packages),
             package_summary,
             scan_warnings,
+            packages_list=packages,
         )
 
-        high_risk_count = reporter.get_high_risk_count(vulnerabilities)
-        if reporter.should_fail(vulnerabilities, fail_threshold):
+        high_risk_count = reporter.get_high_risk_count()
+        if reporter.should_fail(threshold=fail_threshold):
             click.echo(
                 f"\nERROR: {high_risk_count} high+ risk vulnerabilities found "
                 f"exceed threshold of {fail_threshold}. "
