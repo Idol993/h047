@@ -16,9 +16,9 @@ def cli():
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["table", "json"]),
+    type=click.Choice(["table", "json", "markdown"]),
     default="table",
-    help="Output format (table or json)",
+    help="Output format (table, json, or markdown)",
     show_default=True,
 )
 @click.option(
@@ -70,11 +70,19 @@ def scan(
     try:
         click.echo(f"Scanning image: {image}")
         unpacker = ImageUnpacker()
-        packages = unpacker.scan(image)
-        click.echo(f"Found {len(packages)} packages")
+        scan_result = unpacker.scan(image)
+        packages = scan_result.packages
+        scan_warnings = scan_result.warnings
+
+        package_summary = scan_result.package_count_by_source()
+        summary_parts = [f"{k}={v}" for k, v in sorted(package_summary.items())]
+        click.echo(f"Found {len(packages)} packages ({', '.join(summary_parts)})")
 
         if not packages:
             click.echo("Warning: No packages found in image.")
+            if scan_warnings:
+                for warning in scan_warnings:
+                    click.echo(f"  - {warning}")
             return
 
         vulndb = VulnDB(db_path=cache_db, offline=offline)
@@ -82,8 +90,18 @@ def scan(
         vulnerabilities = vulndb.scan_packages(packages, severity_threshold)
         click.echo(f"Found {len(vulnerabilities)} vulnerabilities")
 
-        reporter = Reporter(output_file=output, output_format=output_format)
-        reporter.generate(vulnerabilities, image, len(packages))
+        reporter = Reporter(
+            output_file=output,
+            output_format=output_format,
+            fail_threshold=fail_threshold,
+        )
+        reporter.generate(
+            vulnerabilities,
+            image,
+            len(packages),
+            package_summary,
+            scan_warnings,
+        )
 
         high_risk_count = reporter.get_high_risk_count(vulnerabilities)
         if reporter.should_fail(vulnerabilities, fail_threshold):
@@ -97,6 +115,8 @@ def scan(
 
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
+        import traceback
+        traceback.print_exc()
         sys.exit(2)
 
 

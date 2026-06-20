@@ -1,7 +1,9 @@
 import json
 import sys
+import os
+from datetime import datetime
 from typing import List, Dict, Tuple
-from collections import Counter
+from collections import Counter, defaultdict
 
 from rich.console import Console
 from rich.table import Table
@@ -17,32 +19,138 @@ SEVERITY_COLORS = {
     "critical": "bright_red",
 }
 
+SEVERITY_EMOJI = {
+    "low": "🟢",
+    "medium": "🟡",
+    "high": "🔴",
+    "critical": "💥",
+}
+
 
 class Reporter:
-    def __init__(self, output_file: str = None, output_format: str = "table"):
+    def __init__(
+        self,
+        output_file: str = None,
+        output_format: str = "table",
+        fail_threshold: int = 5,
+    ):
         self.output_file = output_file
         self.output_format = output_format
+        self.fail_threshold = fail_threshold
         self.console = Console()
 
-    def generate(self, vulnerabilities: List, image_source: str, packages_count: int):
+    def generate(
+        self,
+        vulnerabilities: List,
+        image_source: str,
+        packages_count: int,
+        packages_summary: Dict[str, int] = None,
+        scan_warnings: List[str] = None,
+    ):
         if self.output_format == "json":
-            self._generate_json(vulnerabilities, image_source, packages_count)
+            self._generate_json(
+                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+            )
+        elif self.output_format == "markdown":
+            self._generate_markdown(
+                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+            )
         else:
-            self._generate_table(vulnerabilities, image_source, packages_count)
+            self._generate_table(
+                vulnerabilities, image_source, packages_count, packages_summary, scan_warnings
+            )
 
     def _get_output(self):
         if self.output_file and self.output_file != "/dev/stdout":
             return open(self.output_file, "w", encoding="utf-8")
         return sys.stdout
 
-    def _generate_json(self, vulnerabilities: List, image_source: str, packages_count: int):
-        report = {
-            "image_source": image_source,
+    def _build_summary(
+        self, vulnerabilities: List, packages_count: int, packages_summary: Dict[str, int] = None
+    ) -> dict:
+        by_package: Dict[str, Dict] = defaultdict(
+            lambda: {"count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "cves": []}
+        )
+
+        for v in vulnerabilities:
+            pkg_key = f"{v.package_name}@{v.package_version}"
+            by_package[pkg_key]["count"] += 1
+            by_package[pkg_key][v.severity] += 1
+            by_package[pkg_key]["cves"].append(
+                {"cve_id": v.cve_id, "cvss_score": v.cvss_score, "severity": v.severity}
+            )
+
+        by_package_sorted = sorted(
+            by_package.items(),
+            key=lambda x: (x[1]["critical"] * 1000 + x[1]["high"] * 100 + x[1]["medium"] * 10 + x[1]["low"]),
+            reverse=True,
+        )
+
+        packages_dict = {}
+        for pkg_key, stats in by_package_sorted:
+            name, version = pkg_key.rsplit("@", 1)
+            packages_dict[pkg_key] = {
+                "name": name,
+                "version": version,
+                "total_vulns": stats["count"],
+                "by_severity": {
+                    "critical": stats["critical"],
+                    "high": stats["high"],
+                    "medium": stats["medium"],
+                    "low": stats["low"],
+                },
+                "cves": stats["cves"],
+            }
+
+        high_rank = SEVERITY_RANK.get("high", 3)
+        high_risk_count = sum(
+            1 for v in vulnerabilities if SEVERITY_RANK.get(v.severity, 1) >= high_rank
+        )
+
+        ci_summary = {
+            "high_risk_count": high_risk_count,
+            "fail_threshold": self.fail_threshold,
+            "exceeds_threshold": high_risk_count > self.fail_threshold,
+            "exit_code": 1 if high_risk_count > self.fail_threshold else 0,
+        }
+
+        return {
             "total_packages_scanned": packages_count,
+            "packages_by_source": packages_summary or {},
             "total_vulnerabilities": len(vulnerabilities),
-            "severity_summary": self._get_severity_summary(vulnerabilities),
+            "by_severity": {
+                "critical": sum(1 for v in vulnerabilities if v.severity == "critical"),
+                "high": sum(1 for v in vulnerabilities if v.severity == "high"),
+                "medium": sum(1 for v in vulnerabilities if v.severity == "medium"),
+                "low": sum(1 for v in vulnerabilities if v.severity == "low"),
+            },
+            "by_package": packages_dict,
+            "ci": ci_summary,
+        }
+
+    def _generate_json(
+        self,
+        vulnerabilities: List,
+        image_source: str,
+        packages_count: int,
+        packages_summary: Dict[str, int] = None,
+        scan_warnings: List[str] = None,
+    ):
+        summary = self._build_summary(vulnerabilities, packages_count, packages_summary)
+
+        report = {
+            "scan_metadata": {
+                "image_source": image_source,
+                "scan_time": datetime.now().isoformat(),
+                "scan_tool": "container-image-security-scanner",
+                "version": "2.0",
+            },
+            "summary": summary,
             "vulnerabilities": [v.to_dict() for v in vulnerabilities],
         }
+
+        if scan_warnings:
+            report["scan_warnings"] = scan_warnings
 
         f = self._get_output()
         try:
@@ -52,7 +160,115 @@ class Reporter:
             if f is not sys.stdout:
                 f.close()
 
-    def _generate_table(self, vulnerabilities: List, image_source: str, packages_count: int):
+    def _generate_markdown(
+        self,
+        vulnerabilities: List,
+        image_source: str,
+        packages_count: int,
+        packages_summary: Dict[str, int] = None,
+        scan_warnings: List[str] = None,
+    ):
+        summary = self._build_summary(vulnerabilities, packages_count, packages_summary)
+        ci = summary["ci"]
+        by_severity = summary["by_severity"]
+
+        lines = []
+        lines.append("# 🔒 Container Image Security Scan Report")
+        lines.append("")
+        lines.append(f"**Image**: `{image_source}`")
+        lines.append(f"**Scan Time**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+
+        status_emoji = "❌" if ci["exceeds_threshold"] else "✅"
+        status_text = "FAILED" if ci["exceeds_threshold"] else "PASSED"
+        status_color = "red" if ci["exceeds_threshold"] else "green"
+        lines.append(f"## {status_emoji} CI Status: <span style=\"color:{status_color}\">{status_text}</span>")
+        lines.append("")
+        lines.append(f"- High+ Risk Vulnerabilities: **{ci['high_risk_count']}** / Threshold: {ci['fail_threshold']}")
+        lines.append(f"- Exit Code: `{ci['exit_code']}`")
+        lines.append("")
+
+        lines.append("## 📊 Vulnerability Summary")
+        lines.append("")
+        lines.append("| Severity | Count |")
+        lines.append("|----------|-------|")
+        for sev in ["critical", "high", "medium", "low"]:
+            emoji = SEVERITY_EMOJI.get(sev, "")
+            lines.append(f"| {emoji} {sev.capitalize()} | **{by_severity[sev]}** |")
+        lines.append(f"| **Total** | **{len(vulnerabilities)}** |")
+        lines.append("")
+
+        if packages_summary:
+            lines.append("## 📦 Packages Scanned")
+            lines.append("")
+            lines.append("| Source | Count |")
+            lines.append("|--------|-------|")
+            for source, count in sorted(packages_summary.items()):
+                lines.append(f"| {source} | {count} |")
+            lines.append(f"| **Total** | **{packages_count}** |")
+            lines.append("")
+
+        if summary["by_package"]:
+            lines.append("## 🚨 Vulnerabilities by Package")
+            lines.append("")
+            lines.append("| Package | Version | Critical | High | Medium | Low | Total |")
+            lines.append("|---------|---------|----------|------|--------|-----|-------|")
+            for pkg_key, stats in summary["by_package"].items():
+                if stats["total_vulns"] > 0:
+                    bs = stats["by_severity"]
+                    lines.append(
+                        f"| {stats['name']} | {stats['version']} | "
+                        f"{bs['critical']} | {bs['high']} | {bs['medium']} | {bs['low']} | "
+                        f"**{stats['total_vulns']}** |"
+                    )
+            lines.append("")
+
+        if vulnerabilities:
+            lines.append("## 📋 Vulnerability Details")
+            lines.append("")
+            lines.append("| CVE ID | Package | Version | CVSS | Severity | Description |")
+            lines.append("|--------|---------|---------|------|----------|-------------|")
+            for v in vulnerabilities[:50]:
+                emoji = SEVERITY_EMOJI.get(v.severity, "")
+                desc = v.description.replace("|", "\\|").replace("\n", " ")
+                desc = desc[:100] + "..." if len(desc) > 100 else desc
+                lines.append(
+                    f"| [{v.cve_id}](https://nvd.nist.gov/vuln/detail/{v.cve_id}) | "
+                    f"{v.package_name} | {v.package_version} | "
+                    f"{v.cvss_score:.1f} | {emoji} {v.severity.capitalize()} | {desc} |"
+                )
+            if len(vulnerabilities) > 50:
+                lines.append("")
+                lines.append(f"> Showing top 50 of {len(vulnerabilities)} vulnerabilities")
+            lines.append("")
+
+        if scan_warnings:
+            lines.append("## ⚠️ Scan Warnings")
+            lines.append("")
+            for warning in scan_warnings:
+                lines.append(f"- {warning}")
+            lines.append("")
+
+        lines.append("---")
+        lines.append(f"_Generated by Container Image Security Scanner v2.0_")
+
+        output_content = "\n".join(lines) + "\n"
+
+        f = self._get_output()
+        try:
+            f.write(output_content)
+        finally:
+            if f is not sys.stdout:
+                f.close()
+
+    def _generate_table(
+        self,
+        vulnerabilities: List,
+        image_source: str,
+        packages_count: int,
+        packages_summary: Dict[str, int] = None,
+        scan_warnings: List[str] = None,
+    ):
         if self.output_file and self.output_file != "/dev/stdout":
             console = Console(file=self._get_output(), force_terminal=False)
         else:
@@ -60,8 +276,24 @@ class Reporter:
 
         console.print(f"\n[bold]Container Image Security Scan Report[/bold]")
         console.print(f"Image: [cyan]{image_source}[/cyan]")
+        console.print(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         console.print(f"Packages Scanned: {packages_count}")
+
+        if packages_summary:
+            parts = [f"{k}={v}" for k, v in sorted(packages_summary.items())]
+            console.print(f"Package Sources: {', '.join(parts)}")
+
+        high_risk = self.get_high_risk_count(vulnerabilities)
+        exceeds = high_risk > self.fail_threshold
+        status = "[bold red]FAILED[/bold red]" if exceeds else "[bold green]PASSED[/bold green]"
+        console.print(f"CI Status: {status} (High+ risk: {high_risk}/{self.fail_threshold})")
         console.print(f"Total Vulnerabilities: {len(vulnerabilities)}\n")
+
+        if scan_warnings:
+            console.print("[yellow]Scan Warnings:[/yellow]")
+            for warning in scan_warnings:
+                console.print(f"  ⚠️  {warning}")
+            console.print()
 
         summary = self._get_severity_summary(vulnerabilities)
         summary_table = Table(title="Severity Summary", show_header=True, header_style="bold")
@@ -87,6 +319,7 @@ class Reporter:
                 show_lines=False,
             )
             vuln_table.add_column("CVE ID", style="bold cyan", no_wrap=True)
+            vuln_table.add_column("Source", style="dim", no_wrap=True)
             vuln_table.add_column("Package", style="magenta")
             vuln_table.add_column("Version", style="yellow")
             vuln_table.add_column("CVSS", justify="right")
@@ -120,5 +353,6 @@ class Reporter:
                 count += 1
         return count
 
-    def should_fail(self, vulnerabilities: List, threshold: int = 5) -> bool:
+    def should_fail(self, vulnerabilities: List, threshold: int = None) -> bool:
+        threshold = threshold if threshold is not None else self.fail_threshold
         return self.get_high_risk_count(vulnerabilities) > threshold
