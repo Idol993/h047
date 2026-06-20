@@ -6,6 +6,7 @@ OSV_API_URL = "https://api.osv.dev/v1/query"
 
 NVD_RATE_LIMIT = 5
 REQUEST_INTERVAL = 1.0 / NVD_RATE_LIMIT
+OSV_REQUEST_INTERVAL = 0.25
 MAX_WORKERS = 5
 
 CVSS_SEVERITY_LEVELS = {
@@ -20,13 +21,31 @@ SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 CACHE_DB_PATH = "cache.db"
 
 PACKAGE_DB_PATHS = {
-    "dpkg": "var/lib/dpkg/status",
-    "rpm": "var/lib/rpm/Packages",
-    "apk": "lib/apk/db/installed",
+    "dpkg": ["var/lib/dpkg/status"],
+    "rpm": [
+        "var/lib/rpm/Packages",
+        "usr/lib/sysimage/rpm/Packages",
+        "var/lib/rpm/rpmdb.sqlite",
+        "usr/lib/sysimage/rpm/rpmdb.sqlite",
+    ],
+    "apk": ["lib/apk/db/installed"],
 }
 
 LANGUAGE_DEP_FILES = {
     "python": "requirements.txt",
     "nodejs": "package.json",
     "java": "pom.xml",
+}
+
+OSV_ECOSYSTEM_MAP = {
+    "python": "PyPI",
+    "nodejs": "npm",
+    "java": "Maven",
+}
+
+SOURCE_LABELS = {
+    "os": "os",
+    "python": "python",
+    "nodejs": "nodejs",
+    "java": "java",
 }

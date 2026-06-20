@@ -26,6 +26,13 @@ SEVERITY_EMOJI = {
     "critical": "💥",
 }
 
+SOURCE_DISPLAY = {
+    "os": "os",
+    "python": "PyPI",
+    "nodejs": "npm",
+    "java": "Maven",
+}
+
 
 class Reporter:
     def __init__(
@@ -65,11 +72,14 @@ class Reporter:
             return open(self.output_file, "w", encoding="utf-8")
         return sys.stdout
 
+    def _source_label(self, source: str) -> str:
+        return SOURCE_DISPLAY.get(source, source)
+
     def _build_summary(
         self, vulnerabilities: List, packages_count: int, packages_summary: Dict[str, int] = None
     ) -> dict:
         by_package: Dict[str, Dict] = defaultdict(
-            lambda: {"count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "cves": []}
+            lambda: {"count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "cves": [], "source": "os"}
         )
 
         for v in vulnerabilities:
@@ -79,6 +89,7 @@ class Reporter:
             by_package[pkg_key]["cves"].append(
                 {"cve_id": v.cve_id, "cvss_score": v.cvss_score, "severity": v.severity}
             )
+            by_package[pkg_key]["source"] = v.source
 
         by_package_sorted = sorted(
             by_package.items(),
@@ -92,6 +103,7 @@ class Reporter:
             packages_dict[pkg_key] = {
                 "name": name,
                 "version": version,
+                "source": self._source_label(stats["source"]),
                 "total_vulns": stats["count"],
                 "by_severity": {
                     "critical": stats["critical"],
@@ -106,6 +118,9 @@ class Reporter:
         high_risk_count = sum(
             1 for v in vulnerabilities if SEVERITY_RANK.get(v.severity, 1) >= high_rank
         )
+
+        by_source: Dict[str, int] = Counter(v.source for v in vulnerabilities)
+        by_source_display = {self._source_label(k): v for k, v in by_source.items()}
 
         ci_summary = {
             "high_risk_count": high_risk_count,
@@ -124,6 +139,7 @@ class Reporter:
                 "medium": sum(1 for v in vulnerabilities if v.severity == "medium"),
                 "low": sum(1 for v in vulnerabilities if v.severity == "low"),
             },
+            "by_source": by_source_display,
             "by_package": packages_dict,
             "ci": ci_summary,
         }
@@ -143,7 +159,7 @@ class Reporter:
                 "image_source": image_source,
                 "scan_time": datetime.now().isoformat(),
                 "scan_tool": "container-image-security-scanner",
-                "version": "2.0",
+                "version": "3.0",
             },
             "summary": summary,
             "vulnerabilities": [v.to_dict() for v in vulnerabilities],
@@ -198,26 +214,36 @@ class Reporter:
         lines.append(f"| **Total** | **{len(vulnerabilities)}** |")
         lines.append("")
 
+        if summary.get("by_source"):
+            lines.append("### By Source")
+            lines.append("")
+            lines.append("| Source | Count |")
+            lines.append("|--------|-------|")
+            for source, count in sorted(summary["by_source"].items()):
+                lines.append(f"| {source} | {count} |")
+            lines.append("")
+
         if packages_summary:
             lines.append("## 📦 Packages Scanned")
             lines.append("")
             lines.append("| Source | Count |")
             lines.append("|--------|-------|")
             for source, count in sorted(packages_summary.items()):
-                lines.append(f"| {source} | {count} |")
+                display = self._source_label(source)
+                lines.append(f"| {display} | {count} |")
             lines.append(f"| **Total** | **{packages_count}** |")
             lines.append("")
 
         if summary["by_package"]:
             lines.append("## 🚨 Vulnerabilities by Package")
             lines.append("")
-            lines.append("| Package | Version | Critical | High | Medium | Low | Total |")
-            lines.append("|---------|---------|----------|------|--------|-----|-------|")
+            lines.append("| Package | Version | Source | Critical | High | Medium | Low | Total |")
+            lines.append("|---------|---------|--------|----------|------|--------|-----|-------|")
             for pkg_key, stats in summary["by_package"].items():
                 if stats["total_vulns"] > 0:
                     bs = stats["by_severity"]
                     lines.append(
-                        f"| {stats['name']} | {stats['version']} | "
+                        f"| {stats['name']} | {stats['version']} | {stats['source']} | "
                         f"{bs['critical']} | {bs['high']} | {bs['medium']} | {bs['low']} | "
                         f"**{stats['total_vulns']}** |"
                     )
@@ -226,14 +252,16 @@ class Reporter:
         if vulnerabilities:
             lines.append("## 📋 Vulnerability Details")
             lines.append("")
-            lines.append("| CVE ID | Package | Version | CVSS | Severity | Description |")
-            lines.append("|--------|---------|---------|------|----------|-------------|")
+            lines.append("| CVE ID | Source | Package | Version | CVSS | Severity | Description |")
+            lines.append("|--------|--------|---------|---------|------|----------|-------------|")
             for v in vulnerabilities[:50]:
                 emoji = SEVERITY_EMOJI.get(v.severity, "")
                 desc = v.description.replace("|", "\\|").replace("\n", " ")
                 desc = desc[:100] + "..." if len(desc) > 100 else desc
+                source_display = self._source_label(v.source)
                 lines.append(
                     f"| [{v.cve_id}](https://nvd.nist.gov/vuln/detail/{v.cve_id}) | "
+                    f"{source_display} | "
                     f"{v.package_name} | {v.package_version} | "
                     f"{v.cvss_score:.1f} | {emoji} {v.severity.capitalize()} | {desc} |"
                 )
@@ -250,7 +278,7 @@ class Reporter:
             lines.append("")
 
         lines.append("---")
-        lines.append(f"_Generated by Container Image Security Scanner v2.0_")
+        lines.append(f"_Generated by Container Image Security Scanner v3.0_")
 
         output_content = "\n".join(lines) + "\n"
 
@@ -280,7 +308,7 @@ class Reporter:
         console.print(f"Packages Scanned: {packages_count}")
 
         if packages_summary:
-            parts = [f"{k}={v}" for k, v in sorted(packages_summary.items())]
+            parts = [f"{self._source_label(k)}={v}" for k, v in sorted(packages_summary.items())]
             console.print(f"Package Sources: {', '.join(parts)}")
 
         high_risk = self.get_high_risk_count(vulnerabilities)
@@ -295,13 +323,13 @@ class Reporter:
                 console.print(f"  ⚠️  {warning}")
             console.print()
 
-        summary = self._get_severity_summary(vulnerabilities)
+        severity_summary = self._get_severity_summary(vulnerabilities)
         summary_table = Table(title="Severity Summary", show_header=True, header_style="bold")
         summary_table.add_column("Severity", style="bold")
         summary_table.add_column("Count", justify="right")
 
         for severity in ["critical", "high", "medium", "low"]:
-            count = summary.get(severity, 0)
+            count = severity_summary.get(severity, 0)
             color = SEVERITY_COLORS.get(severity, "white")
             summary_table.add_row(
                 Text(severity.capitalize(), style=color),
@@ -311,6 +339,19 @@ class Reporter:
         console.print(summary_table)
         console.print()
 
+        source_summary = Counter(v.source for v in vulnerabilities)
+        if source_summary:
+            source_table = Table(title="By Source", show_header=True, header_style="bold")
+            source_table.add_column("Source", style="bold")
+            source_table.add_column("Count", justify="right")
+            for source in sorted(source_summary.keys()):
+                source_table.add_row(
+                    self._source_label(source),
+                    str(source_summary[source]),
+                )
+            console.print(source_table)
+            console.print()
+
         if vulnerabilities:
             vuln_table = Table(
                 title="Vulnerabilities",
@@ -318,18 +359,20 @@ class Reporter:
                 header_style="bold",
                 show_lines=False,
             )
-            vuln_table.add_column("CVE ID", style="bold cyan", no_wrap=True)
-            vuln_table.add_column("Source", style="dim", no_wrap=True)
-            vuln_table.add_column("Package", style="magenta")
-            vuln_table.add_column("Version", style="yellow")
-            vuln_table.add_column("CVSS", justify="right")
-            vuln_table.add_column("Severity", justify="center")
-            vuln_table.add_column("Description", overflow="fold")
+            vuln_table.add_column("CVE ID", style="bold cyan", no_wrap=True, min_width=16)
+            vuln_table.add_column("Source", no_wrap=True, min_width=6, max_width=8)
+            vuln_table.add_column("Package", style="magenta", no_wrap=False, min_width=12)
+            vuln_table.add_column("Version", style="yellow", no_wrap=True, min_width=10)
+            vuln_table.add_column("CVSS", justify="right", min_width=4)
+            vuln_table.add_column("Severity", justify="center", min_width=8)
+            vuln_table.add_column("Description", overflow="fold", min_width=30)
 
             for vuln in vulnerabilities:
                 severity_color = SEVERITY_COLORS.get(vuln.severity, "white")
+                source_display = self._source_label(vuln.source)
                 vuln_table.add_row(
                     vuln.cve_id,
+                    source_display,
                     vuln.package_name,
                     vuln.package_version,
                     f"{vuln.cvss_score:.1f}",
